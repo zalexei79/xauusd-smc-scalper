@@ -68,7 +68,7 @@ def update_scalp_signal(action, entry, sl, tp):
         }
     print(f"⚡ [SCALPER M1/M5] Новый сигнал для cTrader: {action} @ {entry} (SL: {sl}, TP: {tp})")
 
-# --- АНАЛИЗАТОР СКАЛЬПИНГА (M1/M5 SMC) ---
+# --- АНАЛИЗАТОР СКАЛЬПИНГА (БОЛЕЕ АГРЕССИВНЫЙ M1/M5 SMC) ---
 def analyze_scalper_setup():
     if not is_market_open():
         return
@@ -78,30 +78,43 @@ def analyze_scalper_setup():
         if df_m5 is None or df_m1 is None:
             return
 
-        # 1. Поиск снятия ликвидности на M5
-        m5_window = df_m5.tail(12)
-        local_high = float(m5_window['High'].iloc[:-2].max())
-        local_low = float(m5_window['Low'].iloc[:-2].min())
+        # Исключаем повторную генерацию, если текущий сигнал ещё не обработан cTrader
+        with lock:
+            if scalp_signal["status"] == "NEW":
+                return
+
+        # 1. Определение локальных уровней M5 (за последние 10 свечей)
+        m5_window = df_m5.tail(10)
+        local_high = float(m5_window['High'].iloc[:-1].max())
+        local_low = float(m5_window['Low'].iloc[:-1].min())
         
-        last_m1 = df_m1.iloc[-1]
-        prev_m1 = df_m1.iloc[-2]
+        m1_tail = df_m1.tail(4)
+        last_m1 = m1_tail.iloc[-1]
+        recent_low = float(m1_tail['Low'].min())
+        recent_high = float(m1_tail['High'].max())
         
         # BUY Scalp Setup (Sweep снизу)
-        if prev_m1['Low'] < local_low and last_m1['Close'] > local_low:
+        # Проверяем: минимальная цена за последние свечи пробивала local_low, но закрытие последней M1 выше
+        if recent_low < local_low and last_m1['Close'] > local_low:
             entry = round(float(last_m1['Close']), 2)
-            sl = round(float(prev_m1['Low']) - 1.2, 2)
+            sl = round(recent_low - 0.5, 2)
             risk = entry - sl
-            if 1.0 <= risk <= 3.5:
-                tp = round(entry + (risk * 3.0), 2)  # R:R 1:3
+            
+            # Более гибкий диапазон риска ($1.0 - $6.0) и R:R 1:2
+            if 1.0 <= risk <= 6.0:
+                tp = round(entry + (risk * 2.0), 2)
                 update_scalp_signal("BUY", entry, sl, tp)
 
         # SELL Scalp Setup (Sweep сверху)
-        elif prev_m1['High'] > local_high and last_m1['Close'] < local_high:
+        # Проверяем: максимальная цена за последние свечи пробивала local_high, но закрытие последней M1 ниже
+        elif recent_high > local_high and last_m1['Close'] < local_high:
             entry = round(float(last_m1['Close']), 2)
-            sl = round(float(prev_m1['High']) + 1.2, 2)
+            sl = round(recent_high + 0.5, 2)
             risk = sl - entry
-            if 1.0 <= risk <= 3.5:
-                tp = round(entry - (risk * 3.0), 2)  # R:R 1:3
+            
+            # Более гибкий диапазон риска ($1.0 - $6.0) и R:R 1:2
+            if 1.0 <= risk <= 6.0:
+                tp = round(entry - (risk * 2.0), 2)
                 update_scalp_signal("SELL", entry, sl, tp)
 
     except Exception as e:
@@ -113,7 +126,7 @@ def scalp_scanner_loop():
     while True:
         try:
             analyze_scalper_setup()
-            time.sleep(30)  # Сканируем каждые 30 секунд
+            time.sleep(20)  # Ускоренное сканирование (раз в 20 секунд)
         except Exception as e:
             print(f"[-] Ошибка в scalp_scanner_loop: {e}")
             time.sleep(10)
