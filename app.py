@@ -28,12 +28,16 @@ last_analyzed_candle = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def is_market_open():
-    """Проверяет торговое окно (Пн-Пт, с 08:00 до 20:00 UTC)"""
+    """
+    Проверяет торговое окно Пн-Пт с 08:00 до 20:00 по местному времени (UTC+3 / EEST).
+    На сервере Render (UTC) это соответствует окну с 05:00 до 17:00 UTC.
+    """
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return False
-    return 8 <= now.hour < 20
-
+    
+    # 08:00 - 20:00 EEST (UTC+3) = 05:00 - 17:00 UTC
+    return 5 <= now.hour < 17
 def get_scalp_market_data():
     """Загрузка данных M1 и M5 через Twelve Data API"""
     try:
