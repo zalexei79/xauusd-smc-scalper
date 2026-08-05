@@ -2,7 +2,6 @@ import os
 import time
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
@@ -75,16 +74,16 @@ def fetch_tf_data(interval):
         return interval, None
 
 def get_multi_tf_market_data():
-    """Быстрая последовательно-параллельная загрузка"""
+    """Последовательная загрузка с паузой 1.2с для защиты от лимита 8 запросов/мин"""
     intervals = ["1min", "5min", "15min", "30min"]
     dfs = {}
     
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = executor.map(fetch_tf_data, intervals)
-        for interval, df in results:
-            if df is None:
-                return None, None, None, None
-            dfs[interval] = df
+    for interval in intervals:
+        _, df = fetch_tf_data(interval)
+        if df is None:
+            return None, None, None, None
+        dfs[interval] = df
+        time.sleep(1.2)  # Безопасная задержка между вызовами API
 
     return dfs["1min"], dfs["5min"], dfs["15min"], dfs["30min"]
 
@@ -167,22 +166,27 @@ def generate_hourly_signal():
         risk = max(sl - curr_price, 1.5)
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Hourly Trend SELL")
 
-# --- СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР ПО ЧАСАМ UTC ---
+# --- СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР (ЗАПУСК В HH:01:00 UTC) ---
 def get_seconds_until_next_hour():
-    """Рассчитывает время до следующего ровного часа (с 5-секундным буфером на закрытие свечи)"""
+    """Рассчитывает время до следующей 01-й минуты нового часа (HH:01:00 UTC)"""
     now = datetime.now(timezone.utc)
-    target_time = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+    
+    if now.minute >= 1:
+        target_time = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
+    else:
+        target_time = now.replace(minute=1, second=0, microsecond=0)
+        
     sleep_seconds = (target_time - now).total_seconds()
     return max(sleep_seconds, 5)
 
 def hourly_scheduler_loop():
-    """Стартовый запуск при перезапуске и последующая синхронизация с ровными часами"""
+    """Стартовый запуск при перезапуске и последующая синхронизация по меткам HH:01"""
     time.sleep(3)
     generate_hourly_signal()
 
     while True:
         sleep_time = get_seconds_until_next_hour()
-        print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего ровного часа UTC...")
+        print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующей метки HH:01 UTC...")
         time.sleep(sleep_time)
         generate_hourly_signal()
 
