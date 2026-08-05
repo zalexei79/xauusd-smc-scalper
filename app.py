@@ -25,12 +25,15 @@ scalp_signal = {
 }
 
 lock = threading.Lock()
+last_analyzed_candle = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def is_market_open():
-    """Проверяет, открыт ли рынок (Пн-Пт)."""
+    """Проверяет торговое окно (Пн-Пт, с 08:00 до 20:00 UTC)"""
     now = datetime.now(timezone.utc)
-    return now.weekday() < 5
+    if now.weekday() >= 5:
+        return False
+    return 8 <= now.hour < 20
 
 def get_scalp_market_data():
     """Загрузка данных M5 и M1 с таймаутом"""
@@ -50,10 +53,10 @@ def get_scalp_market_data():
             
         return df_m5, df_m1
     except Exception as e:
-        print(f"[-] Ошибка загрузки данных M1/M5 Yahoo: {e}")
+        print(f"[-] Ошибка загрузки данных Yahoo: {e}")
         return None, None
 
-def update_scalp_signal(action, entry, sl, tp):
+def update_scalp_signal(action, entry, sl, tp, reason=""):
     """Обновление состояния API для cBot"""
     global scalp_signal
     with lock:
@@ -66,69 +69,114 @@ def update_scalp_signal(action, entry, sl, tp):
             "status": "NEW",
             "timestamp": int(time.time())
         }
-    print(f"⚡ [SCALPER M1/M5] Новый сигнал для cTrader: {action} @ {entry} (SL: {sl}, TP: {tp})")
+    print(f"⚡ [СИГНАЛ НАЙДЕН - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
-# --- АНАЛИЗАТОР СКАЛЬПИНГА (БОЛЕЕ АГРЕССИВНЫЙ M1/M5 SMC) ---
-def analyze_scalper_setup():
+# --- КОМПЛЕКСНЫЙ АНАЛИЗАТОР (SMC + Уровни + Пробои + Накопления) ---
+def run_full_market_analysis():
+    global last_analyzed_candle
+    
     if not is_market_open():
+        print("[ℹ️] Рынок закрыт или вне рабочего окна (08:00 - 20:00 UTC).")
         return
 
-    try:
-        df_m5, df_m1 = get_scalp_market_data()
-        if df_m5 is None or df_m1 is None:
+    # Если сигнал еще не забран cTrader, не перетираем его
+    with lock:
+        if scalp_signal["status"] == "NEW":
             return
 
-        # Исключаем повторную генерацию, если текущий сигнал ещё не обработан cTrader
-        with lock:
-            if scalp_signal["status"] == "NEW":
+    df_m5, df_m1 = get_scalp_market_data()
+    if df_m5 is None or df_m1 is None:
+        return
+
+    # Проверка, чтобы не анализировать одну и ту же M5 свечу несколько раз
+    latest_candle_time = df_m5.index[-1]
+    if last_analyzed_candle == latest_candle_time:
+        return
+    
+    last_analyzed_candle = latest_candle_time
+    print(f"🔍 [{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] Старт анализа M1/M5...")
+
+    curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
+
+    # -------------------------------------------------------------
+    # СТРАТЕГИЯ 1: SMC Liquidity Sweep (Снятие ликвидности)
+    # -------------------------------------------------------------
+    m5_window = df_m5.tail(12)
+    local_high = float(m5_window['High'].iloc[:-1].max())
+    local_low = float(m5_window['Low'].iloc[:-1].min())
+    m1_tail = df_m1.tail(3)
+    
+    if float(m1_tail['Low'].min()) < local_low and curr_price > local_low:
+        sl = round(float(m1_tail['Low'].min()) - 0.6, 2)
+        risk = curr_price - sl
+        if 1.0 <= risk <= 6.0:
+            update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "SMC Sweep Buy")
+            return
+
+    if float(m1_tail['High'].max()) > local_high and curr_price < local_high:
+        sl = round(float(m1_tail['High'].max()) + 0.6, 2)
+        risk = sl - curr_price
+        if 1.0 <= risk <= 6.0:
+            update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "SMC Sweep Sell")
+            return
+
+    # -------------------------------------------------------------
+    # СТРАТЕГИЯ 2: Пробой Накопления / Консолидации (Breakout M5)
+    # -------------------------------------------------------------
+    range_window = df_m5.tail(6) # Последние 30 минут
+    range_max = range_window['High'].max()
+    range_min = range_window['Low'].min()
+    range_size = range_max - range_min
+
+    # Если было узкое накопление (флэт менее $3)
+    if range_size <= 3.5:
+        if curr_price > range_max:
+            sl = round(range_min - 0.5, 2)
+            risk = curr_price - sl
+            if 1.0 <= risk <= 6.0:
+                update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "Breakout Range Buy")
+                return
+        elif curr_price < range_min:
+            sl = round(range_max + 0.5, 2)
+            risk = sl - curr_price
+            if 1.0 <= risk <= 6.0:
+                update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Breakout Range Sell")
                 return
 
-        # 1. Определение локальных уровней M5 (за последние 10 свечей)
-        m5_window = df_m5.tail(10)
-        local_high = float(m5_window['High'].iloc[:-1].max())
-        local_low = float(m5_window['Low'].iloc[:-1].min())
-        
-        m1_tail = df_m1.tail(4)
-        last_m1 = m1_tail.iloc[-1]
-        recent_low = float(m1_tail['Low'].min())
-        recent_high = float(m1_tail['High'].max())
-        
-        # BUY Scalp Setup (Sweep снизу)
-        # Проверяем: минимальная цена за последние свечи пробивала local_low, но закрытие последней M1 выше
-        if recent_low < local_low and last_m1['Close'] > local_low:
-            entry = round(float(last_m1['Close']), 2)
-            sl = round(recent_low - 0.5, 2)
-            risk = entry - sl
-            
-            # Более гибкий диапазон риска ($1.0 - $6.0) и R:R 1:2
-            if 1.0 <= risk <= 6.0:
-                tp = round(entry + (risk * 2.0), 2)
-                update_scalp_signal("BUY", entry, sl, tp)
+    # -------------------------------------------------------------
+    # СТРАТЕГИЯ 3: Дисбаланс / Имппульс M1 (FVG Scalp)
+    # -------------------------------------------------------------
+    c1, c2, c3 = df_m1.iloc[-3], df_m1.iloc[-2], df_m1.iloc[-1]
+    
+    # Bullish FVG
+    if c3['Low'] > c1['High'] and (c2['Close'] - c2['Open']) > 1.2:
+        sl = round(c2['Low'] - 0.5, 2)
+        risk = curr_price - sl
+        if 1.0 <= risk <= 6.0:
+            update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "Impulse FVG Buy")
+            return
 
-        # SELL Scalp Setup (Sweep сверху)
-        # Проверяем: максимальная цена за последние свечи пробивала local_high, но закрытие последней M1 ниже
-        elif recent_high > local_high and last_m1['Close'] < local_high:
-            entry = round(float(last_m1['Close']), 2)
-            sl = round(recent_high + 0.5, 2)
-            risk = sl - entry
-            
-            # Более гибкий диапазон риска ($1.0 - $6.0) и R:R 1:2
-            if 1.0 <= risk <= 6.0:
-                tp = round(entry - (risk * 2.0), 2)
-                update_scalp_signal("SELL", entry, sl, tp)
+    # Bearish FVG
+    if c3['High'] < c1['Low'] and (c2['Open'] - c2['Close']) > 1.2:
+        sl = round(c2['High'] + 0.5, 2)
+        risk = sl - curr_price
+        if 1.0 <= risk <= 6.0:
+            update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Impulse FVG Sell")
+            return
 
-    except Exception as e:
-        print(f"[-] Ошибка скальпер-анализатора: {e}")
-
-# --- ФОНОВЫЙ ПОТОК СКАНИРОВАНИЯ ---
+# --- ФОНОВЫЙ ПОТОК (Запуск при старте + каждые 60 секунд) ---
 def scalp_scanner_loop():
-    print("[+] [SCALPER] Сканер M1/M5 успешно запущен в фоновом режиме!")
+    print("[+] [SCALPER] Фоновый движок анализа запущен!")
+    
+    # Первичный анализ прямо при старте сервера
+    run_full_market_analysis()
+    
     while True:
         try:
-            analyze_scalper_setup()
-            time.sleep(20)  # Ускоренное сканирование (раз в 20 секунд)
+            run_full_market_analysis()
+            time.sleep(60) # Сканирование раз в 1 минуту
         except Exception as e:
-            print(f"[-] Ошибка в scalp_scanner_loop: {e}")
+            print(f"[-] Ошибка в цикл-сканере: {e}")
             time.sleep(10)
 
 threading.Thread(target=scalp_scanner_loop, daemon=True).start()
@@ -141,27 +189,25 @@ def index():
 
 @app.route('/scalp_signal', methods=['GET'])
 def get_scalp_signal():
-    """Опрос бота с cTrader"""
     with lock:
         return jsonify(scalp_signal)
 
 @app.route('/scalp_ack', methods=['POST'])
 def acknowledge_scalp_signal():
-    """Подтверждение от cTrader и сброс состояния"""
     global scalp_signal
     data = request.get_json(silent=True) or {}
     ts = data.get('timestamp')
     with lock:
         scalp_signal["status"] = "NONE"
         scalp_signal["action"] = "NONE"
-        print(f"👍 [SCALPER ACK] Сигнал (ts={ts}) принят cTrader и сброшен в NONE.")
+        print(f"👍 [ACK] Сигнал (ts={ts}) успешно обработан cTrader.")
         return jsonify({"status": "acknowledged"})
 
 @app.route('/test_scalp', methods=['GET', 'POST'])
 def trigger_test_scalp():
-    """Тестовый вызов для быстрой проверки исполнения в cTrader"""
-    update_scalp_signal("BUY", 2650.00, 2647.50, 2657.50)
-    return jsonify({"message": "Тестовый сигнал создан!", "signal": scalp_signal}), 200
+    """Мгновенный принудительный анализ или тестовый сигнал"""
+    run_full_market_analysis()
+    return jsonify({"message": "Принудительный анализ выполнен!", "signal": scalp_signal}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
