@@ -13,7 +13,6 @@ app = Flask(__name__)
 TWELVE_DATA_API_KEY = "c997ad22987e477e83034ea132621542"
 SYMBOL = "XAU/USD"
 
-# Глобальное состояние сигнала скальпера для cTrader
 scalp_signal = {
     "symbol": "XAUUSD",
     "action": "NONE",
@@ -25,50 +24,41 @@ scalp_signal = {
 }
 
 lock = threading.Lock()
-last_analyzed_candle = None
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def is_market_open():
-    """
-    Проверяет торговое окно Пн-Пт с 08:00 до 20:00 по местному времени (Europe/Chisinau).
-    Автоматически учитывает UTC+3 (лето) / UTC+2 (зима).
-    """
+    """Проверка окна 08:00 - 20:00 (Moldova / Europe/Chisinau)"""
     now_local = datetime.now(ZoneInfo("Europe/Chisinau"))
     if now_local.weekday() >= 5:
         return False
     return 8 <= now_local.hour < 20
 
-def get_scalp_market_data():
-    """Загрузка данных M1 и M5 через Twelve Data API"""
+def get_multi_tf_market_data():
+    """Загрузка данных M1, M5, M15 и M30 через Twelve Data API"""
     try:
-        url_m1 = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1min&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
-        url_m5 = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=5min&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
-
-        res_m1 = requests.get(url_m1, timeout=10).json()
-        res_m5 = requests.get(url_m5, timeout=10).json()
-
-        if "values" not in res_m1 or "values" not in res_m5:
-            err_m1 = res_m1.get('message', '')
-            err_m5 = res_m5.get('message', '')
-            print(f"[-] Ошибка TwelveData API: {err_m1 or err_m5}")
-            return None, None
-
-        df_m1 = pd.DataFrame(res_m1["values"])
-        df_m5 = pd.DataFrame(res_m5["values"])
-
-        for df in [df_m1, df_m5]:
+        dataframes = {}
+        intervals = ["1min", "5min", "15min", "30min"]
+        
+        for interval in intervals:
+            url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
+            res = requests.get(url, timeout=10).json()
+            
+            if "values" not in res:
+                print(f"[-] Ошибка TwelveData API на таймфрейме {interval}: {res.get('message', '')}")
+                return None
+            
+            df = pd.DataFrame(res["values"])
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             df.iloc[:] = df.iloc[::-1].values
+            dataframes[interval] = df
 
-        return df_m5, df_m1
+        return dataframes["1min"], dataframes["5min"], dataframes["15min"], dataframes["30min"]
     except Exception as e:
-        print(f"[-] Ошибка загрузки TwelveData: {e}")
-        return None, None
+        print(f"[-] Ошибка загрузки данных: {e}")
+        return None, None, None, None
 
 def update_scalp_signal(action, entry, sl, tp, reason=""):
-    """Обновление состояния API для cBot"""
     global scalp_signal
     with lock:
         scalp_signal = {
@@ -80,112 +70,92 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
             "status": "NEW",
             "timestamp": int(time.time())
         }
-    print(f"⚡ [СИГНАЛ НАЙДЕН - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
+    print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
-# --- КОМПЛЕКСНЫЙ АНАЛИЗАТОР ---
-def run_full_market_analysis():
-    global last_analyzed_candle
-
+def generate_hourly_signal():
+    """Принудительный аналитический скан с учетом M30/M15 тренда и M5/M1 входа"""
     if not is_market_open():
         now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-        print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее местное время: {now_local_str}")
+        print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
         return
 
-    with lock:
-        if scalp_signal["status"] == "NEW":
-            return
-
-    df_m5, df_m1 = get_scalp_market_data()
-    if df_m5 is None or df_m1 is None:
-        return
-
-    latest_candle_time = df_m5.iloc[-1].get('datetime', str(time.time()))
-    if last_analyzed_candle == latest_candle_time:
-        return
-
-    last_analyzed_candle = latest_candle_time
     now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-    print(f"🔍 [{now_str}] Старт анализа XAU/USD (Twelve Data)...")
+    print(f"🔍 [{now_str}] Старт комплексного multi-TF анализа XAU/USD (M1, M5, M15, M30)...")
+
+    df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
+    if df_m1 is None:
+        return
 
     curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
 
-    # 1. SMC Liquidity Sweep
-    m5_window = df_m5.tail(12)
-    local_high = float(m5_window['High'].iloc[:-1].max())
-    local_low = float(m5_window['Low'].iloc[:-1].min())
-    m1_tail = df_m1.tail(3)
+    # --- 1. ОПРЕДЕЛЕНИЕ ТРЕНДА НА M30 И M15 ---
+    m30_ema = df_m30['Close'].tail(10).mean()
+    m15_ema = df_m15['Close'].tail(10).mean()
+    
+    # Тренд считаем бычьим (BULLISH), если цена выше EMA M30 и M15
+    is_bullish_bias = curr_price >= m30_ema and curr_price >= m15_ema
 
-    if float(m1_tail['Low'].min()) < local_low and curr_price > local_low:
+    # --- 2. SMC LIQUIDITY SWEEP (с учетом контекста) ---
+    m5_tail = df_m5.tail(12)
+    m1_tail = df_m1.tail(5)
+    local_high = float(m5_tail['High'].iloc[:-1].max())
+    local_low = float(m5_tail['Low'].iloc[:-1].min())
+
+    if float(m1_tail['Low'].min()) < local_low and is_bullish_bias:
+        sl = round(float(m1_tail['Low'].min()) - 0.5, 2)
+        risk = max(curr_price - sl, 1.5)
+        update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "M30-Trend + SMC Buy Sweep")
+        return
+
+    if float(m1_tail['High'].max()) > local_high and not is_bullish_bias:
+        sl = round(float(m1_tail['High'].max()) + 0.5, 2)
+        risk = max(sl - curr_price, 1.5)
+        update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "M30-Trend + SMC Sell Sweep")
+        return
+
+    # --- 3. BREAKOUT M15/M5 ---
+    range_max = float(m15_tail_max := df_m15.tail(4)['High'].max())
+    range_min = float(df_m15.tail(4)['Low'].min())
+
+    if curr_price >= range_max - 0.5 and is_bullish_bias:
+        sl = round(range_min - 0.5, 2)
+        risk = max(curr_price - sl, 1.5)
+        update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "M15 Breakout High")
+        return
+    elif curr_price <= range_min + 0.5 and not is_bullish_bias:
+        sl = round(range_max + 0.5, 2)
+        risk = max(sl - curr_price, 1.5)
+        update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "M15 Breakout Low")
+        return
+
+    # --- 4. ДЕФОЛТНЫЙ ПОЧАСОВОЙ СИГНАЛ ПО ТРЕНДУ M30/M15 ---
+    if is_bullish_bias:
         sl = round(float(m1_tail['Low'].min()) - 0.6, 2)
-        risk = curr_price - sl
-        if 1.0 <= risk <= 6.0:
-            update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "SMC Sweep Buy")
-            return
-
-    if float(m1_tail['High'].max()) > local_high and curr_price < local_high:
+        risk = max(curr_price - sl, 1.5)
+        update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "M30 Trend Follow BUY")
+    else:
         sl = round(float(m1_tail['High'].max()) + 0.6, 2)
-        risk = sl - curr_price
-        if 1.0 <= risk <= 6.0:
-            update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "SMC Sweep Sell")
-            return
+        risk = max(sl - curr_price, 1.5)
+        update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "M30 Trend Follow SELL")
 
-    # 2. Breakout Range (M5)
-    range_window = df_m5.tail(6)
-    range_max = float(range_window['High'].max())
-    range_min = float(range_window['Low'].min())
-    range_size = range_max - range_min
-
-    if range_size <= 3.5:
-        if curr_price > range_max:
-            sl = round(range_min - 0.5, 2)
-            risk = curr_price - sl
-            if 1.0 <= risk <= 6.0:
-                update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "Breakout Range Buy")
-                return
-        elif curr_price < range_min:
-            sl = round(range_max + 0.5, 2)
-            risk = sl - curr_price
-            if 1.0 <= risk <= 6.0:
-                update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Breakout Range Sell")
-                return
-
-    # 3. Impulse FVG (M1)
-    c1, c2, c3 = df_m1.iloc[-3], df_m1.iloc[-2], df_m1.iloc[-1]
-
-    if float(c3['Low']) > float(c1['High']) and (float(c2['Close']) - float(c2['Open'])) > 1.2:
-        sl = round(float(c2['Low']) - 0.5, 2)
-        risk = curr_price - sl
-        if 1.0 <= risk <= 6.0:
-            update_scalp_signal("BUY", curr_price, sl, round(curr_price + risk * 2.0, 2), "Impulse FVG Buy")
-            return
-
-    if float(c3['High']) < float(c1['Low']) and (float(c2['Open']) - float(c2['Close'])) > 1.2:
-        sl = round(float(c2['High']) + 0.5, 2)
-        risk = sl - curr_price
-        if 1.0 <= risk <= 6.0:
-            update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Impulse FVG Sell")
-            return
-
-# --- ФОНОВЫЙ ПОТОК (Запуск при старте + каждые 60 секунд) ---
-def scalp_scanner_loop():
-    print("[+] [SCALPER] Фоновый движок анализа (Twelve Data) запущен!")
-    run_full_market_analysis()
+# --- ФОНОВЫЙ ПОТОК (Запуск при старте + ровно каждый час) ---
+def hourly_scheduler_loop():
+    print("[+] [SCALPER] Почасовой multi-TF таймер запущен!")
+    generate_hourly_signal()
 
     while True:
-        try:
-            run_full_market_analysis()
-            time.sleep(60)
-        except Exception as e:
-            print(f"[-] Ошибка в цикл-сканере: {e}")
-            time.sleep(10)
+        now = datetime.now()
+        seconds_until_next_hour = 3600 - (now.minute * 60 + now.second)
+        time.sleep(seconds_until_next_hour)
+        generate_hourly_signal()
 
-threading.Thread(target=scalp_scanner_loop, daemon=True).start()
+threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
 
-# --- HTTP ENDPOINTS (REST API) ---
+# --- REST API ---
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"status": "running", "bot": "XAUUSD SMC Scalper Engine (Twelve Data)"})
+    return jsonify({"status": "running", "bot": "XAUUSD Multi-TF Hourly Scalper Engine"})
 
 @app.route('/scalp_signal', methods=['GET'])
 def get_scalp_signal():
@@ -195,18 +165,11 @@ def get_scalp_signal():
 @app.route('/scalp_ack', methods=['POST'])
 def acknowledge_scalp_signal():
     global scalp_signal
-    data = request.get_json(silent=True) or {}
-    ts = data.get('timestamp')
     with lock:
         scalp_signal["status"] = "NONE"
         scalp_signal["action"] = "NONE"
-        print(f"👍 [ACK] Сигнал (ts={ts}) успешно обработан cTrader.")
+        print("👍 [ACK] Сигнал принят cTrader.")
         return jsonify({"status": "acknowledged"})
-
-@app.route('/test_scalp', methods=['GET', 'POST'])
-def trigger_test_scalp():
-    run_full_market_analysis()
-    return jsonify({"message": "Принудительный анализ выполнен!", "signal": scalp_signal}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
