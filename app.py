@@ -15,6 +15,7 @@ app = Flask(__name__)
 TWELVE_DATA_API_KEY = "c997ad22987e477e83034ea132621542"
 SYMBOL = "XAU/USD"
 SIGNAL_FILE = "/tmp/scalp_signal.json"
+SIGNAL_LIFETIME_SECONDS = 300  # Сигнал активен для всех cBot в течение 5 минут (300 сек)
 
 EMPTY_SIGNAL = {
     "symbol": "XAUUSD",
@@ -185,17 +186,39 @@ def index():
     return jsonify({"status": "running", "bot": "XAUUSD Multi-TF Hourly Scalper Engine"})
 
 @app.route('/scalp_signal', methods=['GET'])
+@app.route('/signal', methods=['GET'])
 def get_scalp_signal():
+    """
+    Раздает актуальный сигнал ВСЕМ подключенным cBot терминалам.
+    Сигнал отдается со статусом NEW в течение 5 минут с момента генерации.
+    """
     with lock:
         signal = load_signal_from_file()
-        return jsonify(signal)
+        current_time = int(time.time())
+        signal_timestamp = signal.get("timestamp", 0)
+
+        # Проверяем возраст сигнала
+        if signal.get("action") != "NONE" and (current_time - signal_timestamp) <= SIGNAL_LIFETIME_SECONDS:
+            signal["status"] = "NEW"
+        else:
+            signal["status"] = "EXPIRED"
+            signal["action"] = "NONE"
+
+        return jsonify(signal), 200
 
 @app.route('/scalp_ack', methods=['POST'])
+@app.route('/ack', methods=['POST'])
 def acknowledge_scalp_signal():
-    with lock:
-        save_signal_to_file(EMPTY_SIGNAL)
-        print("👍 [ACK] Сигнал сброшен после обработки cTrader.")
-        return jsonify({"status": "acknowledged"})
+    """
+    Принимает подтверждение (ACK) от любого cBot без сброса сигнала для других клиентов.
+    """
+    data = request.get_json(silent=True) or {}
+    ts = data.get('timestamp', 0)
+    symbol = data.get('symbol', 'UNKNOWN')
+    client_id = data.get('client_id', request.remote_addr)
+
+    print(f"👍 [ACK] Сигнал подтвержден cBot [Client: {client_id} | Symbol: {symbol} | Timestamp: {ts}]")
+    return jsonify({"status": "acknowledged", "message": "Signal logged for user"}), 200
 
 @app.route('/force_signal', methods=['GET', 'POST'])
 def force_signal():
