@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -12,8 +13,9 @@ app = Flask(__name__)
 # --- НАСТРОЙКИ СИСТЕМЫ ---
 TWELVE_DATA_API_KEY = "c997ad22987e477e83034ea132621542"
 SYMBOL = "XAU/USD"
+SIGNAL_FILE = "/tmp/scalp_signal.json"
 
-scalp_signal = {
+EMPTY_SIGNAL = {
     "symbol": "XAUUSD",
     "action": "NONE",
     "entry": 0.0,
@@ -24,6 +26,22 @@ scalp_signal = {
 }
 
 lock = threading.Lock()
+
+def save_signal_to_file(signal_data):
+    try:
+        with open(SIGNAL_FILE, "w") as f:
+            json.dump(signal_data, f)
+    except Exception as e:
+        print(f"[-] Ошибка записи сигнала в файл: {e}")
+
+def load_signal_from_file():
+    if not os.path.exists(SIGNAL_FILE):
+        return EMPTY_SIGNAL
+    try:
+        with open(SIGNAL_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return EMPTY_SIGNAL
 
 def is_market_open():
     """Проверка окна 08:00 - 20:00 (Europe/Chisinau)"""
@@ -42,7 +60,7 @@ def get_batch_market_data():
         for tf in ["1min", "5min", "15min", "30min"]:
             tf_data = res.get(tf, {}) if isinstance(res, dict) else {}
             if "values" not in tf_data:
-                print(f"[-] Ошибка получения данных для {tf}: {tf_data.get('message', 'No values')}")
+                print(f"[-] Ошибка получения данных для {tf}")
                 return None, None, None, None
             
             df = pd.DataFrame(tf_data["values"])
@@ -58,17 +76,17 @@ def get_batch_market_data():
         return None, None, None, None
 
 def update_scalp_signal(action, entry, sl, tp, reason=""):
-    global scalp_signal
+    signal = {
+        "symbol": "XAUUSD",
+        "action": action,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "status": "NEW",
+        "timestamp": int(time.time())
+    }
     with lock:
-        scalp_signal = {
-            "symbol": "XAUUSD",
-            "action": action,
-            "entry": float(entry),
-            "sl": float(sl),
-            "tp": float(tp),
-            "status": "NEW",
-            "timestamp": int(time.time())
-        }
+        save_signal_to_file(signal)
     print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
 def generate_hourly_signal():
@@ -126,7 +144,7 @@ def generate_hourly_signal():
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "M15 Breakout Low")
         return
 
-    # 4. Базовый сигнал по тренду (гарантированная точка входа)
+    # 4. Базовый сигнал по тренду
     if is_bullish:
         sl = round(float(m1_tail['Low'].min()) - 0.6, 2)
         risk = max(curr_price - sl, 1.5)
@@ -136,10 +154,8 @@ def generate_hourly_signal():
         risk = max(sl - curr_price, 1.5)
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Hourly Trend SELL")
 
-# --- ФОНОВЫЙ ТАЙМЕР НА КАЖДЫЙ ЧАС ---
 def hourly_scheduler_loop():
-    # Задержка 5 сек после старта сервиса для стабильного соединения
-    time.sleep(5)
+    time.sleep(3)
     generate_hourly_signal()
 
     while True:
@@ -148,7 +164,6 @@ def hourly_scheduler_loop():
         time.sleep(seconds_until_next_hour)
         generate_hourly_signal()
 
-# Запуск фонового потока
 threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
 
 # --- REST API ENDPOINTS ---
@@ -160,23 +175,22 @@ def index():
 @app.route('/scalp_signal', methods=['GET'])
 def get_scalp_signal():
     with lock:
-        return jsonify(scalp_signal)
+        signal = load_signal_from_file()
+        return jsonify(signal)
 
 @app.route('/scalp_ack', methods=['POST'])
 def acknowledge_scalp_signal():
-    global scalp_signal
     with lock:
-        scalp_signal["status"] = "NONE"
-        scalp_signal["action"] = "NONE"
-        print("👍 [ACK] Сигнал принят cTrader.")
+        save_signal_to_file(EMPTY_SIGNAL)
+        print("👍 [ACK] Сигнал сброшен после обработки cTrader.")
         return jsonify({"status": "acknowledged"})
 
 @app.route('/force_signal', methods=['GET', 'POST'])
 def force_signal():
-    """Ручной вызов сигнала в любое время для проверки"""
     generate_hourly_signal()
     with lock:
-        return jsonify({"message": "Принудительный сигнал сгенерирован", "signal": scalp_signal})
+        signal = load_signal_from_file()
+        return jsonify({"message": "Принудительный сигнал сгенерирован", "signal": signal})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
