@@ -2,6 +2,7 @@ import os
 import time
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
@@ -50,30 +51,38 @@ def is_market_open():
         return False
     return 8 <= now_local.hour < 20
 
-def get_batch_market_data():
-    """Загрузка M1, M5, M15, M30 за 1 быстрой запрос"""
+def fetch_tf_data(interval):
+    """Вспомогательная функция для параллельного запроса одного интервала"""
     try:
-        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1min,5min,15min,30min&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
-        res = requests.get(url, timeout=12).json()
-
-        dfs = {}
-        for tf in ["1min", "5min", "15min", "30min"]:
-            tf_data = res.get(tf, {}) if isinstance(res, dict) else {}
-            if "values" not in tf_data:
-                print(f"[-] Ошибка получения данных для {tf}")
-                return None, None, None, None
-            
-            df = pd.DataFrame(tf_data["values"])
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = df[col].astype(float)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
-            df.iloc[:] = df.iloc[::-1].values
-            dfs[tf] = df
-
-        return dfs["1min"], dfs["5min"], dfs["15min"], dfs["30min"]
+        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
+        res = requests.get(url, timeout=8).json()
+        if "values" not in res:
+            print(f"[-] Ошибка TwelveData на {interval}: {res.get('message', 'No values')}")
+            return interval, None
+        
+        df = pd.DataFrame(res["values"])
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        df.iloc[:] = df.iloc[::-1].values
+        return interval, df
     except Exception as e:
-        print(f"[-] Ошибка загрузки Batch Data: {e}")
-        return None, None, None, None
+        print(f"[-] Ошибка загрузки {interval}: {e}")
+        return interval, None
+
+def get_multi_tf_market_data():
+    """Параллельная быстрая загрузка M1, M5, M15, M30"""
+    intervals = ["1min", "5min", "15min", "30min"]
+    dfs = {}
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = executor.map(fetch_tf_data, intervals)
+        for interval, df in results:
+            if df is None:
+                return None, None, None, None
+            dfs[interval] = df
+
+    return dfs["1min"], dfs["5min"], dfs["15min"], dfs["30min"]
 
 def update_scalp_signal(action, entry, sl, tp, reason=""):
     signal = {
@@ -90,18 +99,18 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
     print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
 def generate_hourly_signal():
-    """Генерация лучшего сигнала на текущий час"""
+    """Генерация сигнала по multi-TF анализу"""
     if not is_market_open():
         now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
         print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
         return
 
     now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-    print(f"🔍 [{now_str}] Старт Multi-TF анализа XAU/USD (Batch API)...")
+    print(f"🔍 [{now_str}] Старт Multi-TF анализа XAU/USD (Parallel Requests)...")
 
-    df_m1, df_m5, df_m15, df_m30 = get_batch_market_data()
+    df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
     if df_m1 is None:
-        print("[-] Не удалось получить данные свечей.")
+        print("[-] Не удалось загрузить свечи по всем таймфреймам.")
         return
 
     curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
