@@ -52,10 +52,13 @@ def is_market_open():
     return 8 <= now_local.hour < 20
 
 def fetch_tf_data(interval):
-    """Вспомогательная функция для параллельного запроса одного интервала"""
+    """Безопасная загрузка таймфрейма с заголовками и таймаутом"""
     try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
         url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
-        res = requests.get(url, timeout=8).json()
+        
+        res = requests.get(url, headers=headers, timeout=10).json()
+        
         if "values" not in res:
             print(f"[-] Ошибка TwelveData на {interval}: {res.get('message', 'No values')}")
             return interval, None
@@ -67,11 +70,11 @@ def fetch_tf_data(interval):
         df.iloc[:] = df.iloc[::-1].values
         return interval, df
     except Exception as e:
-        print(f"[-] Ошибка загрузки {interval}: {e}")
+        print(f"[-] Исключение при загрузке {interval}: {e}")
         return interval, None
 
 def get_multi_tf_market_data():
-    """Параллельная быстрая загрузка M1, M5, M15, M30"""
+    """Быстрая последовательно-параллельная загрузка"""
     intervals = ["1min", "5min", "15min", "30min"]
     dfs = {}
     
@@ -106,11 +109,11 @@ def generate_hourly_signal():
         return
 
     now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-    print(f"🔍 [{now_str}] Старт Multi-TF анализа XAU/USD (Parallel Requests)...")
+    print(f"🔍 [{now_str}] Старт Multi-TF анализа XAU/USD (M1, M5, M15, M30)...")
 
     df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
     if df_m1 is None:
-        print("[-] Не удалось загрузить свечи по всем таймфреймам.")
+        print("[-] Ошибка: Не все таймфреймы были загружены. Пропуск скана.")
         return
 
     curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
@@ -164,7 +167,7 @@ def generate_hourly_signal():
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Hourly Trend SELL")
 
 def hourly_scheduler_loop():
-    time.sleep(3)
+    time.sleep(5)
     generate_hourly_signal()
 
     while True:
@@ -179,7 +182,7 @@ threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"status": "running", "bot": "XAUUSD Hourly Scalper Engine"})
+    return jsonify({"status": "running", "bot": "XAUUSD Multi-TF Hourly Scalper Engine"})
 
 @app.route('/scalp_signal', methods=['GET'])
 def get_scalp_signal():
