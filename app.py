@@ -3,7 +3,7 @@ import time
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
 import pandas as pd
@@ -153,7 +153,7 @@ def generate_hourly_signal():
         return
     elif curr_price <= range_min + 0.5 and not is_bullish:
         sl = round(range_max + 0.5, 2)
-        risk = max(sl - curr_price, 1.5)
+        risk = max(range_max + 0.5, 1.5)
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "M15 Breakout Low")
         return
 
@@ -167,14 +167,23 @@ def generate_hourly_signal():
         risk = max(sl - curr_price, 1.5)
         update_scalp_signal("SELL", curr_price, sl, round(curr_price - risk * 2.0, 2), "Hourly Trend SELL")
 
+# --- СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР ПО ЧАСАМ UTC ---
+def get_seconds_until_next_hour():
+    """Рассчитывает время до следующего ровного часа (с 5-секундным буфером на закрытие свечи)"""
+    now = datetime.now(timezone.utc)
+    target_time = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+    sleep_seconds = (target_time - now).total_seconds()
+    return max(sleep_seconds, 5)
+
 def hourly_scheduler_loop():
-    time.sleep(5)
+    """Стартовый запуск при перезапуске и последующая синхронизация с ровными часами"""
+    time.sleep(3)
     generate_hourly_signal()
 
     while True:
-        now = datetime.now()
-        seconds_until_next_hour = 3600 - (now.minute * 60 + now.second)
-        time.sleep(seconds_until_next_hour)
+        sleep_time = get_seconds_until_next_hour()
+        print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего ровного часа UTC...")
+        time.sleep(sleep_time)
         generate_hourly_signal()
 
 threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
