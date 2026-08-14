@@ -80,27 +80,36 @@ def is_market_open():
         return False
     return 8 <= now_local.hour < 20
 
-def fetch_tf_data(interval):
-    """Загрузка таймфрейма через TwelveData"""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
-        
-        res = requests.get(url, headers=headers, timeout=10).json()
-        
-        if "values" not in res:
-            print(f"[-] Ошибка TwelveData на {interval}: {res.get('message', 'No values')}")
-            return interval, None
-        
-        df = pd.DataFrame(res["values"])
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
-        df.iloc[:] = df.iloc[::-1].values
-        return interval, df
-    except Exception as e:
-        print(f"[-] Исключение при загрузке {interval}: {e}")
-        return interval, None
+def fetch_tf_data(interval, retries=3):
+    """Загрузка таймфрейма через TwelveData с повторными попытками при таймауте"""
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    for attempt in range(1, retries + 1):
+        try:
+            # Увеличен таймаут: 5 сек подключение, 15 сек чтение
+            res = requests.get(url, headers=headers, timeout=(5, 15)).json()
+            
+            if "values" not in res:
+                print(f"[-] Ошибка TwelveData на {interval} (попытка {attempt}/{retries}): {res.get('message', 'No values')}")
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return interval, None
+            
+            df = pd.DataFrame(res["values"])
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+            df.iloc[:] = df.iloc[::-1].values
+            return interval, df
+
+        except Exception as e:
+            print(f"[-] Исключение при загрузке {interval} (попытка {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(2)
+
+    return interval, None
 
 def get_multi_tf_market_data():
     """Последовательная загрузка таймфреймов с паузой 1.2с"""
@@ -214,7 +223,7 @@ def generate_hourly_signal():
         elif curr_price <= range_min + 0.5 and not is_bullish:
             raw_sl_dist = (range_max + 0.5) - curr_price
             sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
-            sl = round(curr_price + sl_dist, 2)
+            sl = round(curr_price - sl_dist, 2)
             tp = round(curr_price - (sl_dist * RR_RATIO), 2)
             update_scalp_signal("SELL", curr_price, sl, tp, "M15 Breakout Low")
             return
