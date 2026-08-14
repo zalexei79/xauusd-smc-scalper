@@ -156,78 +156,82 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
 
 def generate_hourly_signal():
     """Генерация сигнала по multi-TF анализу"""
-    if not is_market_open():
-        now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-        print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
-        return
+    try:
+        if not is_market_open():
+            now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
+            print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
+            return
 
-    now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-    print(f"🔍 [{now_str}] Старт Multi-TF скальп-анализа XAU/USD (M1, M5, M15, M30)...")
+        now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
+        print(f"🔍 [{now_str}] Старт Multi-TF скальп-анализа XAU/USD (M1, M5, M15, M30)...")
 
-    df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
-    if df_m1 is None or df_m5 is None:
-        print("[-] Ошибка: Не все таймфреймы были загружены. Пропуск скана.")
-        return
+        df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
+        if df_m1 is None or df_m5 is None or df_m15 is None or df_m30 is None:
+            print("[-] Ошибка: Не все таймфреймы были загружены. Пропуск скана.")
+            return
 
-    curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
-    m5_atr = calculate_atr(df_m5, 14) or 2.5
+        curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
+        m5_atr = calculate_atr(df_m5, 14) or 2.5
 
-    # 1. Анализ тренда M30 / M15
-    m30_ema = df_m30['Close'].tail(10).mean()
-    m15_ema = df_m15['Close'].tail(10).mean()
-    is_bullish = curr_price >= m30_ema and curr_price >= m15_ema
+        # 1. Анализ тренда M30 / M15
+        m30_ema = df_m30['Close'].tail(10).mean()
+        m15_ema = df_m15['Close'].tail(10).mean()
+        is_bullish = curr_price >= m30_ema and curr_price >= m15_ema
 
-    # 2. SMC Sweep (M5/M1)
-    m5_tail = df_m5.tail(12)
-    m1_tail = df_m1.tail(5)
-    local_high = float(m5_tail['High'].iloc[:-1].max())
-    local_low = float(m5_tail['Low'].iloc[:-1].min())
+        # 2. SMC Sweep (M5/M1)
+        m5_tail = df_m5.tail(12)
+        m1_tail = df_m1.tail(5)
+        local_high = float(m5_tail['High'].iloc[:-1].max())
+        local_low = float(m5_tail['Low'].iloc[:-1].min())
 
-    if float(m1_tail['Low'].min()) < local_low and is_bullish:
-        raw_sl_dist = curr_price - (float(m1_tail['Low'].min()) - 1.0)
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
-        sl = round(curr_price - sl_dist, 2)
-        tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("BUY", curr_price, sl, tp, "M30-Trend + SMC Buy Sweep")
-        return
+        if float(m1_tail['Low'].min()) < local_low and is_bullish:
+            raw_sl_dist = curr_price - (float(m1_tail['Low'].min()) - 1.0)
+            sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
+            sl = round(curr_price - sl_dist, 2)
+            tp = round(curr_price + (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("BUY", curr_price, sl, tp, "M30-Trend + SMC Buy Sweep")
+            return
 
-    if float(m1_tail['High'].max()) > local_high and not is_bullish:
-        raw_sl_dist = (float(m1_tail['High'].max()) + 1.0) - curr_price
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
-        sl = round(curr_price + sl_dist, 2)
-        tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("SELL", curr_price, sl, tp, "M30-Trend + SMC Sell Sweep")
-        return
+        if float(m1_tail['High'].max()) > local_high and not is_bullish:
+            raw_sl_dist = (float(m1_tail['High'].max()) + 1.0) - curr_price
+            sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
+            sl = round(curr_price + sl_dist, 2)
+            tp = round(curr_price - (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("SELL", curr_price, sl, tp, "M30-Trend + SMC Sell Sweep")
+            return
 
-    # 3. Breakout M15
-    range_max = float(df_m15.tail(4)['High'].max())
-    range_min = float(df_m15.tail(4)['Low'].min())
+        # 3. Breakout M15
+        range_max = float(df_m15.tail(4)['High'].max())
+        range_min = float(df_m15.tail(4)['Low'].min())
 
-    if curr_price >= range_max - 0.5 and is_bullish:
-        raw_sl_dist = curr_price - (range_min - 0.5)
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
-        sl = round(curr_price - sl_dist, 2)
-        tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("BUY", curr_price, sl, tp, "M15 Breakout High")
-        return
-    elif curr_price <= range_min + 0.5 and not is_bullish:
-        raw_sl_dist = (range_max + 0.5) - curr_price
-        sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
-        sl = round(curr_price + sl_dist, 2)
-        tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("SELL", curr_price, sl, tp, "M15 Breakout Low")
-        return
+        if curr_price >= range_max - 0.5 and is_bullish:
+            raw_sl_dist = curr_price - (range_min - 0.5)
+            sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
+            sl = round(curr_price - sl_dist, 2)
+            tp = round(curr_price + (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("BUY", curr_price, sl, tp, "M15 Breakout High")
+            return
+        elif curr_price <= range_min + 0.5 and not is_bullish:
+            raw_sl_dist = (range_max + 0.5) - curr_price
+            sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
+            sl = round(curr_price + sl_dist, 2)
+            tp = round(curr_price - (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("SELL", curr_price, sl, tp, "M15 Breakout Low")
+            return
 
-    # 4. Базовый сигнал по тренду
-    sl_dist = max(MIN_SL_DIST, m5_atr * 1.8)
-    if is_bullish:
-        sl = round(curr_price - sl_dist, 2)
-        tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("BUY", curr_price, sl, tp, "Hourly Trend BUY")
-    else:
-        sl = round(curr_price + sl_dist, 2)
-        tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-        update_scalp_signal("SELL", curr_price, sl, tp, "Hourly Trend SELL")
+        # 4. Базовый сигнал по тренду
+        sl_dist = max(MIN_SL_DIST, m5_atr * 1.8)
+        if is_bullish:
+            sl = round(curr_price - sl_dist, 2)
+            tp = round(curr_price + (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("BUY", curr_price, sl, tp, "Hourly Trend BUY")
+        else:
+            sl = round(curr_price + sl_dist, 2)
+            tp = round(curr_price - (sl_dist * RR_RATIO), 2)
+            update_scalp_signal("SELL", curr_price, sl, tp, "Hourly Trend SELL")
+
+    except Exception as e:
+        print(f"[-] Исключение при выполнении generate_hourly_signal: {e}")
 
 # --- СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР (HH:01:00 UTC) ---
 def get_seconds_until_next_hour():
@@ -240,13 +244,20 @@ def get_seconds_until_next_hour():
 
 def hourly_scheduler_loop():
     time.sleep(3)
-    generate_hourly_signal()
+    try:
+        generate_hourly_signal()
+    except Exception as e:
+        print(f"[-] Ошибка при стартовом скане: {e}")
 
     while True:
-        sleep_time = get_seconds_until_next_hour()
-        print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего скана...")
-        time.sleep(sleep_time)
-        generate_hourly_signal()
+        try:
+            sleep_time = get_seconds_until_next_hour()
+            print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего скана...")
+            time.sleep(sleep_time)
+            generate_hourly_signal()
+        except Exception as e:
+            print(f"[-] Ошибка в фоновом цикле таймера: {e}")
+            time.sleep(10)  # Защитная пауза перед следующим шагом
 
 threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
 
