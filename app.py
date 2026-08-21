@@ -33,8 +33,16 @@ logger.addHandler(console_handler)
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "xauusd_secret_key_2026")
 
-# Flask-SocketIO с поддержкой CORS
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+# Flask-SocketIO с поддержкой прямого WebSocket туннеля
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='gevent',
+    transports=['websocket', 'polling'],
+    allow_upgrades=True,
+    ping_timeout=60,
+    ping_interval=25
+)
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "c997ad22987e477e83034ea132621542")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
