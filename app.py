@@ -1,62 +1,169 @@
 import os
 import time
 import json
+import sqlite3
+import logging
 import threading
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import pandas as pd
 import requests
 
-app = Flask(__name__)
+# ==========================================
+# РЕГИСТРАЦИЯ И НАСТРОЙКА ЛОГИРОВАНИЯ
+# ==========================================
+log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+log_handler = RotatingFileHandler('xau_bot.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+log_handler.setFormatter(log_formatter)
 
-# --- НАСТРОЙКИ СКАЛЬПЕРА (СЕРВЕР №2) ---
+logger = logging.getLogger("XAUUSD_Scalper")
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
+
+# ==========================================
+# ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ ПРИЛОЖЕНИЯ
+# ==========================================
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "xauusd_secret_key_2026")
+
+# Flask-SocketIO с поддержкой CORS
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "c997ad22987e477e83034ea132621542")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@xauusd_scalp_signal")  # Канал для скальпинга
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@xauusd_scalp_signal")
 
-SYMBOL = "XAU/USD"
-SIGNAL_FILE = "/tmp/scalp_signal.json"
-SIGNAL_LIFETIME_SECONDS = 300  # Сигнал активен для cBot в течение 5 минут (300 сек)
+SYMBOL_TWELVE = "XAU/USD"
+ROOM_NAME = "XAUUSD"
+DB_PATH = "subscriptions.db"
 
-# --- ПАРАМЕТРЫ РИСК-МЕНЕДЖМЕНТА (ЗАЩИТА ОТ ВЫБИВАНИЯ ПО СТОПАМ) ---
-MIN_SL_DIST = 3.5  # Минимальный Стоп-Лосс ($3.5 = 35 пипсов)
-MAX_SL_DIST = 12.0 # Максимальный Стоп-Лосс ($12.0 = 120 пипсов)
-RR_RATIO = 2.0     # Риск/Прибыль 1:2
-
-EMPTY_SIGNAL = {
-    "symbol": "XAUUSD",
-    "action": "NONE",
-    "entry": 0.0,
-    "sl": 0.0,
-    "tp": 0.0,
-    "status": "NONE",
-    "timestamp": 0
-}
+MIN_SL_DIST = 3.5
+MAX_SL_DIST = 12.0
+RR_RATIO = 2.0
 
 lock = threading.Lock()
 
-def save_signal_to_file(signal_data):
+# ==========================================
+# БАЗА ДАННЫХ И АВТОРИЗАЦИЯ
+# ==========================================
+def init_db():
+    """Автоматическая инициализация SQLite базы данных для подписок"""
     try:
-        with open(SIGNAL_FILE, "w") as f:
-            json.dump(signal_data, f)
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key TEXT UNIQUE NOT NULL,
+                account_id TEXT NOT NULL,
+                telegram_id TEXT,
+                expires_at TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute('''
+                INSERT INTO users (api_key, account_id, telegram_id, expires_at, is_active)
+                VALUES ('TEST_KEY_123', '12345678', '00000000', '2030-01-01T00:00:00Z', 1)
+            ''')
+            logger.info("Создана тестовая учётная запись: API_KEY='TEST_KEY_123', Account='12345678'")
+            
+        conn.commit()
+        conn.close()
+        logger.info("База данных subscriptions.db успешно проверена/инициализирована.")
     except Exception as e:
-        print(f"[-] Ошибка записи сигнала в файл: {e}")
+        logger.error(f"Ошибка при инициализации базы данных: {e}")
 
-def load_signal_from_file():
-    if not os.path.exists(SIGNAL_FILE):
-        return EMPTY_SIGNAL
+def validate_client(api_key, account_id):
+    """Проверка лицензионного ключа, привязанного счета и срока действия подписки"""
+    if not api_key or not account_id:
+        return False, "Отсутствуют авторизационные данные (api_key / account_id)"
+    
     try:
-        with open(SIGNAL_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return EMPTY_SIGNAL
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT account_id, expires_at, is_active FROM users WHERE api_key = ?
+        ''', (api_key,))
+        row = cursor.fetchone()
+        conn.close()
 
+        if not row:
+            return False, "Неверный API-ключ"
+
+        db_account_id, expires_at_str, is_active = row
+
+        if not is_active:
+            return False, "Подписка деактивирована"
+
+        if str(db_account_id) != str(account_id):
+            return False, f"Ключ привязан к другому счету ({db_account_id})"
+
+        expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > expires_at:
+            return False, "Срок действия подписки истек"
+
+        return True, "Авторизация успешна"
+    except Exception as e:
+        logger.error(f"Ошибка проверки лицензии в БД: {e}")
+        return False, "Внутренняя ошибка сервера при проверке подписки"
+
+# ==========================================
+# WEBSOCKET EVENT HANDLERS
+# ==========================================
+@socketio.on('connect')
+def handle_connect():
+    logger.info(f"[WS] Клиент подключился (SID: {request.sid}, IP: {request.remote_addr})")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info(f"[WS] Клиент отключился (SID: {request.sid})")
+
+@socketio.on('join_instrument')
+def handle_join_instrument(data):
+    """
+    Авторизация cBot и вход в комнату XAUUSD
+    Ожидаемый JSON: {"symbol": "XAUUSD", "api_key": "...", "account_id": "12345678"}
+    """
+    data = data or {}
+    symbol = data.get('symbol', '').upper()
+    api_key = data.get('api_key', '')
+    account_id = data.get('account_id', '')
+
+    if symbol != ROOM_NAME:
+        emit('response', {'status': 'ERROR', 'message': f'Неверный инструмент: {symbol}. Ожидается {ROOM_NAME}'})
+        return
+
+    is_valid, msg = validate_client(api_key, account_id)
+    if is_valid:
+        join_room(ROOM_NAME)
+        logger.info(f"[WS SUCCESS] Клиент {request.sid} (Счет: {account_id}) вошел в комнату {ROOM_NAME}")
+        emit('response', {'status': 'SUCCESS', 'message': f'Успешно подключено к комнате {ROOM_NAME}'})
+    else:
+        logger.warning(f"[WS DENIED] Отклонено для {request.sid} (Счет: {account_id}): {msg}")
+        emit('response', {'status': 'ERROR', 'message': f'Ошибка авторизации: {msg}'})
+
+@socketio.on('leave_instrument')
+def handle_leave_instrument(data):
+    leave_room(ROOM_NAME)
+    logger.info(f"[WS] Клиент {request.sid} покинул комнату {ROOM_NAME}")
+
+# ==========================================
+# ТЕЛЕГРАМ УВЕДОМЛЕНИЯ
+# ==========================================
 def send_telegram(text):
-    """Отправка уведомлений в канал скальпинга"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    
+
     chat_id = TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID.startswith("@") or TELEGRAM_CHAT_ID.startswith("-") else f"@{TELEGRAM_CHAT_ID}"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -67,12 +174,15 @@ def send_telegram(text):
     try:
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
-            print(f"[+] Скальп-сигнал отправлен в {chat_id}!")
+            logger.info(f"[+] Сигнал отправлен в Telegram ({chat_id})")
         else:
-            print(f"[-] Ошибка отправки в Telegram ({res.status_code}): {res.text}")
+            logger.error(f"[-] Ошибка отправки в Telegram ({res.status_code}): {res.text}")
     except Exception as e:
-        print(f"[-] Исключение при отправке в Telegram: {e}")
+        logger.error(f"[-] Исключение при отправке в Telegram: {e}")
 
+# ==========================================
+# ВЫГРУЗКА ДАННЫХ И РАСЧЕТ АНАЛИТИКИ
+# ==========================================
 def is_market_open():
     """Проверка окна 08:00 - 20:00 (Europe/Chisinau)"""
     now_local = datetime.now(ZoneInfo("Europe/Chisinau"))
@@ -81,41 +191,35 @@ def is_market_open():
     return 8 <= now_local.hour < 20
 
 def fetch_tf_data(interval, retries=3):
-    """Загрузка таймфрейма через TwelveData с повторными попытками при таймауте"""
-    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL_TWELVE}&interval={interval}&outputsize=30&apikey={TWELVE_DATA_API_KEY}"
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     for attempt in range(1, retries + 1):
         try:
-            # Увеличен таймаут: 5 сек подключение, 15 сек чтение
             res = requests.get(url, headers=headers, timeout=(5, 15)).json()
-            
             if "values" not in res:
-                print(f"[-] Ошибка TwelveData на {interval} (попытка {attempt}/{retries}): {res.get('message', 'No values')}")
+                logger.warning(f"[-] Ошибка TwelveData на {interval} (попытка {attempt}/{retries}): {res.get('message', 'No values')}")
                 if attempt < retries:
                     time.sleep(2)
                     continue
                 return interval, None
-            
+
             df = pd.DataFrame(res["values"])
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = df[col].astype(float)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
             df.iloc[:] = df.iloc[::-1].values
             return interval, df
-
         except Exception as e:
-            print(f"[-] Исключение при загрузке {interval} (попытка {attempt}/{retries}): {e}")
+            logger.error(f"[-] Исключение при загрузке {interval} (попытка {attempt}/{retries}): {e}")
             if attempt < retries:
                 time.sleep(2)
 
     return interval, None
 
 def get_multi_tf_market_data():
-    """Последовательная загрузка таймфреймов с паузой 1.2с"""
     intervals = ["1min", "5min", "15min", "30min"]
     dfs = {}
-    
     for interval in intervals:
         _, df = fetch_tf_data(interval)
         if df is None:
@@ -126,31 +230,30 @@ def get_multi_tf_market_data():
     return dfs["1min"], dfs["5min"], dfs["15min"], dfs["30min"]
 
 def calculate_atr(df, period=14):
-    """Расчет динамического фильтра волатильности ATR"""
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['Close'].shift()).abs()
     low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
 
-def update_scalp_signal(action, entry, sl, tp, reason=""):
-    signal = {
-        "symbol": "XAUUSD",
+def broadcast_signal(action, entry, sl, tp, reason=""):
+    signal_data = {
+        "symbol": ROOM_NAME,
         "action": action,
         "entry": float(entry),
         "sl": float(sl),
         "tp": float(tp),
-        "status": "NEW",
+        "reason": reason,
         "timestamp": int(time.time())
     }
-    with lock:
-        save_signal_to_file(signal)
-    
-    now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-    print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
-    # Формирование отчета для канала скальпинга
-    icon = "🟢" if action == "BUY" else "🔴"
+    # Мгновенная рассылка в WebSocket-комнату XAUUSD
+    socketio.emit('new_signal', signal_data, room=ROOM_NAME)
+    logger.info(f"⚡ [WEBSOCKET PUSH -> {ROOM_NAME}] Action: {action} | Entry: {entry} | SL: {sl} | TP: {tp} | Reason: {reason}")
+
+    # Отправка в Telegram
+    now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
+    icon = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "ℹ️")
     msg = (
         f"⚡ <b>GOLD SCALPER SIGNAL</b> {icon}\n\n"
         f"<b>Инструмент:</b> XAU/USD (Gold)\n"
@@ -163,20 +266,31 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
     )
     send_telegram(msg)
 
+def send_test_signal():
+    """Тестовый сигнал при запуске сервера для проверки cBot"""
+    logger.info("🧪 Генерация тестового WebSocket сигнала при старте...")
+    broadcast_signal(
+        action="TEST",
+        entry=2700.00,
+        sl=2690.00,
+        tp=2720.00,
+        reason="Инициализация сервера / Проверка подключения"
+    )
+
 def generate_hourly_signal():
     """Генерация сигнала по multi-TF анализу"""
     try:
         if not is_market_open():
             now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-            print(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
+            logger.info(f"[ℹ️] Вне рабочего окна (08:00 - 20:00). Текущее время: {now_local_str}")
             return
 
         now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
-        print(f"🔍 [{now_str}] Старт Multi-TF скальп-анализа XAU/USD (M1, M5, M15, M30)...")
+        logger.info(f"🔍 [{now_str}] Старт Multi-TF скальп-анализа XAU/USD (M1, M5, M15, M30)...")
 
         df_m1, df_m5, df_m15, df_m30 = get_multi_tf_market_data()
         if df_m1 is None or df_m5 is None or df_m15 is None or df_m30 is None:
-            print("[-] Ошибка: Не все таймфреймы были загружены. Пропуск скана.")
+            logger.error("[-] Ошибка: Не все таймфреймы загружены. Пропуск скана.")
             return
 
         curr_price = round(float(df_m1['Close'].iloc[-1]), 2)
@@ -198,7 +312,7 @@ def generate_hourly_signal():
             sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
             sl = round(curr_price - sl_dist, 2)
             tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("BUY", curr_price, sl, tp, "M30-Trend + SMC Buy Sweep")
+            broadcast_signal("BUY", curr_price, sl, tp, "M30-Trend + SMC Buy Sweep")
             return
 
         if float(m1_tail['High'].max()) > local_high and not is_bullish:
@@ -206,7 +320,7 @@ def generate_hourly_signal():
             sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST, m5_atr * 2.0))
             sl = round(curr_price + sl_dist, 2)
             tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("SELL", curr_price, sl, tp, "M30-Trend + SMC Sell Sweep")
+            broadcast_signal("SELL", curr_price, sl, tp, "M30-Trend + SMC Sell Sweep")
             return
 
         # 3. Breakout M15
@@ -218,14 +332,14 @@ def generate_hourly_signal():
             sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
             sl = round(curr_price - sl_dist, 2)
             tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("BUY", curr_price, sl, tp, "M15 Breakout High")
+            broadcast_signal("BUY", curr_price, sl, tp, "M15 Breakout High")
             return
         elif curr_price <= range_min + 0.5 and not is_bullish:
             raw_sl_dist = (range_max + 0.5) - curr_price
             sl_dist = max(MIN_SL_DIST, min(raw_sl_dist, MAX_SL_DIST))
             sl = round(curr_price - sl_dist, 2)
             tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("SELL", curr_price, sl, tp, "M15 Breakout Low")
+            broadcast_signal("SELL", curr_price, sl, tp, "M15 Breakout Low")
             return
 
         # 4. Базовый сигнал по тренду
@@ -233,83 +347,49 @@ def generate_hourly_signal():
         if is_bullish:
             sl = round(curr_price - sl_dist, 2)
             tp = round(curr_price + (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("BUY", curr_price, sl, tp, "Hourly Trend BUY")
+            broadcast_signal("BUY", curr_price, sl, tp, "Hourly Trend BUY")
         else:
             sl = round(curr_price + sl_dist, 2)
             tp = round(curr_price - (sl_dist * RR_RATIO), 2)
-            update_scalp_signal("SELL", curr_price, sl, tp, "Hourly Trend SELL")
+            broadcast_signal("SELL", curr_price, sl, tp, "Hourly Trend SELL")
 
     except Exception as e:
-        print(f"[-] Исключение при выполнении generate_hourly_signal: {e}")
+        logger.error(f"[-] Исключение при выполнении generate_hourly_signal: {e}")
 
-# --- СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР (HH:01:00 UTC) ---
-def get_seconds_until_next_hour():
+# ==========================================
+# СИНХРОНИЗИРОВАННЫЙ ТАЙМЕР (HH:59:00 UTC)
+# ==========================================
+def get_seconds_until_next_hour_59():
+    """Расчет секунд до ближайшей минуты HH:59:00 UTC"""
     now = datetime.now(timezone.utc)
-    if now.minute >= 1:
-        target_time = (now + timedelta(hours=1)).replace(minute=1, second=0, microsecond=0)
+    if now.minute >= 59:
+        target_time = (now + timedelta(hours=1)).replace(minute=59, second=0, microsecond=0)
     else:
-        target_time = now.replace(minute=1, second=0, microsecond=0)
+        target_time = now.replace(minute=59, second=0, microsecond=0)
     return max((target_time - now).total_seconds(), 5)
 
 def hourly_scheduler_loop():
     time.sleep(3)
-    try:
-        generate_hourly_signal()
-    except Exception as e:
-        print(f"[-] Ошибка при стартовом скане: {e}")
+    
+    # Отправка тестового сигнала при старте
+    send_test_signal()
 
     while True:
         try:
-            sleep_time = get_seconds_until_next_hour()
-            print(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего скана...")
+            sleep_time = get_seconds_until_next_hour_59()
+            logger.info(f"⏳ Ожидание {round(sleep_time / 60, 1)} мин. ({int(sleep_time)} сек.) до следующего скана (HH:59)...")
             time.sleep(sleep_time)
             generate_hourly_signal()
         except Exception as e:
-            print(f"[-] Ошибка в фоновом цикле таймера: {e}")
-            time.sleep(10)  # Защитная пауза перед следующим шагом
+            logger.error(f"[-] Ошибка в фоновом цикле таймера: {e}")
+            time.sleep(10)
 
-threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
-
-# --- REST API ENDPOINTS ---
-
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({"status": "running", "bot": "XAUUSD Multi-TF Hourly Scalper Engine"})
-
-@app.route('/scalp_signal', methods=['GET'])
-@app.route('/signal', methods=['GET'])
-def get_scalp_signal():
-    with lock:
-        signal = load_signal_from_file()
-        current_time = int(time.time())
-        signal_timestamp = signal.get("timestamp", 0)
-
-        if signal.get("action") != "NONE" and (current_time - signal_timestamp) <= SIGNAL_LIFETIME_SECONDS:
-            signal["status"] = "NEW"
-        else:
-            signal["status"] = "EXPIRED"
-            signal["action"] = "NONE"
-
-        return jsonify(signal), 200
-
-@app.route('/scalp_ack', methods=['POST'])
-@app.route('/ack', methods=['POST'])
-def acknowledge_scalp_signal():
-    data = request.get_json(silent=True) or {}
-    ts = data.get('timestamp', 0)
-    symbol = data.get('symbol', 'UNKNOWN')
-    client_id = data.get('client_id', request.remote_addr)
-
-    print(f"👍 [ACK] Сигнал подтвержден cBot [Client: {client_id} | Symbol: {symbol} | Timestamp: {ts}]")
-    return jsonify({"status": "acknowledged", "message": "Signal logged for user"}), 200
-
-@app.route('/force_signal', methods=['GET', 'POST'])
-def force_signal():
-    generate_hourly_signal()
-    with lock:
-        signal = load_signal_from_file()
-        return jsonify({"message": "Принудительный сигнал сгенерирован", "signal": signal})
-
+# ==========================================
+# ЗАПУСК СЕРВЕРА
+# ==========================================
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    init_db()
+    threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
+    port = int(os.environ.get('PORT', 5001))
+    logger.info(f"🚀 Сервер XAUUSD Scalper запущен на порту {port}...")
+    socketio.run(app, host='0.0.0.0', port=port)
