@@ -1,26 +1,20 @@
 import os
 import time
 import json
-import uuid
 import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request
 import pandas as pd
 import requests
 
-app = Flask(__name__)
-
-# --- НАСТРОЙКИ СКАЛЬПЕРА (СЕРВЕР №2) ---
+# --- НАСТРОЙКИ СКАЛЬПЕРА ---
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "c997ad22987e477e83034ea132621542")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8874872969:AAHtxvHw_mupom466pm3jh4BkZEjEAQ180A")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@xauusd_scalp_signal")  # Канал для скальпинга
 
 SYMBOL = "XAU/USD"
 SIGNAL_FILE = "/tmp/scalp_signal.json"
 DB_FILE = "subscribers.db"
-SIGNAL_LIFETIME_SECONDS = 300  # Сигнал активен для cBot в течение 5 минут (300 сек)
 
 # --- ПАРАМЕТРЫ РИСК-МЕНЕДЖМЕНТА (ЗАЩИТА ОТ ВЫБИВАНИЯ ПО СТОПАМ) ---
 MIN_SL_DIST = 3.5  # Минимальный Стоп-Лосс ($3.5 = 35 пипсов)
@@ -40,7 +34,7 @@ EMPTY_SIGNAL = {
 lock = threading.Lock()
 
 # ==========================================
-# БАЗА ДАННЫХ ПОДПИСЧИКОВ И ПРОВЕРКА КЛЮЧЕЙ
+# БАЗА ДАННЫХ ПОДПИСЧИКОВ И ПЕРСОНАЛЬНАЯ СВЯЗЬ
 # ==========================================
 def init_db():
     """Инициализация БД подписок"""
@@ -50,32 +44,78 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id TEXT UNIQUE,
-                api_key TEXT UNIQUE,
                 is_active INTEGER DEFAULT 1,
                 expire_date TEXT
             )
         ''')
         conn.commit()
 
-def validate_key(api_key: str) -> bool:
-    """Проверка активности API-ключа подписки"""
-    if not api_key:
-        return False
+def add_subscriber(telegram_id: str, days: int = 30):
+    """Вспомогательная функция для добавления/продления подписчика"""
+    expire_dt = datetime.now(timezone.utc) + timedelta(days=days)
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (telegram_id, is_active, expire_date)
+            VALUES (?, 1, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                is_active = 1,
+                expire_date = excluded.expire_date
+        ''', (str(telegram_id), expire_dt.isoformat()))
+        conn.commit()
+    print(f"[+] Подписчик {telegram_id} активен до {expire_dt.isoformat()}")
+
+def get_active_subscribers() -> list:
+    """Получение списка Telegram Chat ID всех активных подписчиков"""
+    active_ids = []
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT expire_date, is_active FROM users WHERE api_key = ?", (api_key,))
-            row = cursor.fetchone()
-            if not row:
-                return False
-            expire_date_str, is_active = row
-            if is_active == 1:
-                expire_dt = datetime.fromisoformat(expire_date_str)
-                if expire_dt > datetime.now(timezone.utc):
-                    return True
+            cursor.execute("SELECT telegram_id, expire_date FROM users WHERE is_active = 1")
+            rows = cursor.fetchall()
+            now_utc = datetime.now(timezone.utc)
+            
+            for telegram_id, expire_date_str in rows:
+                try:
+                    expire_dt = datetime.fromisoformat(expire_date_str)
+                    if expire_dt > now_utc:
+                        active_ids.append(telegram_id)
+                    else:
+                        cursor.execute("UPDATE users SET is_active = 0 WHERE telegram_id = ?", (telegram_id,))
+                except Exception as ex:
+                    print(f"[-] Ошибка парсинга даты пользователя {telegram_id}: {ex}")
+            conn.commit()
     except Exception as e:
-        print(f"[-] Ошибка проверки ключа БД: {e}")
-    return False
+        print(f"[-] Ошибка чтения базы подписчиков: {e}")
+    return active_ids
+
+def broadcast_telegram_signal(text: str):
+    """Персональная рассылка сигнала всем активным подписчикам по их chat_id"""
+    if not TELEGRAM_BOT_TOKEN:
+        print("[-] Ошибка: TELEGRAM_BOT_TOKEN не задан.")
+        return
+
+    subscribers = get_active_subscribers()
+    if not subscribers:
+        print("[ℹ️] Активных подписчиков для рассылки нет.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    for chat_id in subscribers:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        try:
+            res = requests.post(url, json=payload, timeout=5)
+            if res.status_code == 200:
+                print(f"[+] Сигнал успешно доставлен пользователю {chat_id}")
+            else:
+                print(f"[-] Ошибка отправки пользователю {chat_id} ({res.status_code}): {res.text}")
+        except Exception as e:
+            print(f"[-] Исключение при отправке пользователю {chat_id}: {e}")
 
 # ==========================================
 # РАБОТА С СИГНАЛАМИ И ФАЙЛАМИ
@@ -95,27 +135,6 @@ def load_signal_from_file():
             return json.load(f)
     except Exception:
         return EMPTY_SIGNAL
-
-def send_telegram(text):
-    """Отправка уведомлений в канал скальпинга"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    
-    chat_id = TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID.startswith("@") or TELEGRAM_CHAT_ID.startswith("-") else f"@{TELEGRAM_CHAT_ID}"
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            print(f"[+] Скальп-сигнал отправлен в {chat_id}!")
-        else:
-            print(f"[-] Ошибка отправки в Telegram ({res.status_code}): {res.text}")
-    except Exception as e:
-        print(f"[-] Исключение при отправке в Telegram: {e}")
 
 def is_market_open():
     """Проверка окна 08:00 - 20:00 (Europe/Chisinau)"""
@@ -192,7 +211,7 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
     now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
     print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
-    # Формирование отчета для канала скальпинга
+    # Формирование отчета для личной рассылки подписчикам
     icon = "🟢" if action == "BUY" else "🔴"
     msg = (
         f"⚡ <b>GOLD SCALPER SIGNAL</b> {icon}\n\n"
@@ -204,10 +223,10 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
         f"💡 <b>Стратегия:</b> {reason}\n"
         f"🕒 <i>Время сигнала: {now_str} (Кишинёв)</i>"
     )
-    send_telegram(msg)
+    broadcast_telegram_signal(msg)
 
 def generate_hourly_signal():
-    """Генерация сигнала по multi-TF анализу (Вся оригинальная аналитика сохраненена!)"""
+    """Генерация сигнала по multi-TF анализу"""
     try:
         if not is_market_open():
             now_local_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
@@ -311,86 +330,11 @@ def hourly_scheduler_loop():
             print(f"[-] Ошибка в фоновом цикле таймера: {e}")
             time.sleep(10)
 
-threading.Thread(target=hourly_scheduler_loop, daemon=True).start()
-
-# ==========================================
-# ОБНОВЛЕННЫЕ REST API ENDPOINTS С ПРОВЕРКОЙ КЛЮЧА
-# ==========================================
-
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({"status": "running", "bot": "XAUUSD Multi-TF Hourly Scalper Engine"})
-
-@app.route('/scalp_signal', methods=['GET'])
-@app.route('/signal', methods=['GET'])
-def get_scalp_signal():
-    # ПРОВЕРКА КЛЮЧА ПОДПИСКИ КЛИЕНТА
-    client_key = request.args.get('api_key')
-    if not validate_key(client_key):
-        return jsonify({"error": "Unauthorized or Subscription Expired"}), 403
-
-    with lock:
-        signal = load_signal_from_file()
-        current_time = int(time.time())
-        signal_timestamp = signal.get("timestamp", 0)
-
-        if signal.get("action") != "NONE" and (current_time - signal_timestamp) <= SIGNAL_LIFETIME_SECONDS:
-            signal["status"] = "NEW"
-        else:
-            signal["status"] = "EXPIRED"
-            signal["action"] = "NONE"
-
-        return jsonify(signal), 200
-
-@app.route('/scalp_ack', methods=['POST'])
-@app.route('/ack', methods=['POST'])
-def acknowledge_scalp_signal():
-    client_key = request.args.get('api_key')
-    if not validate_key(client_key):
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.get_json(silent=True) or {}
-    ts = data.get('timestamp', 0)
-    symbol = data.get('symbol', 'UNKNOWN')
-    client_id = data.get('client_id', request.remote_addr)
-
-    print(f"👍 [ACK] Сигнал подтвержден cBot [Client: {client_id} | Symbol: {symbol} | Timestamp: {ts}]")
-    return jsonify({"status": "acknowledged", "message": "Signal logged for user"}), 200
-
-@app.route('/api/v1/add_user', methods=['POST'])
-def add_user_api():
-    """Эндпоинт генерации ключей для подписки"""
-    data = request.json or {}
-    telegram_id = str(data.get("telegram_id", "user_" + str(int(time.time()))))
-    days = int(data.get("days", 30))
-    
-    new_key = str(uuid.uuid4())
-    expire_dt = datetime.now(timezone.utc) + timedelta(days=days)
-    
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO users (telegram_id, api_key, is_active, expire_date)
-            VALUES (?, ?, 1, ?)
-        ''', (telegram_id, new_key, expire_dt.isoformat()))
-        conn.commit()
-        
-    return jsonify({"status": "success", "api_key": new_key, "expires": expire_dt.isoformat()}), 200
-
-@app.route('/force_signal', methods=['GET', 'POST'])
-def force_signal():
-    generate_hourly_signal()
-    with lock:
-        signal = load_signal_from_file()
-        return jsonify({"message": "Принудительный сигнал сгенерирован", "signal": signal})
-
 if __name__ == '__main__':
     init_db()
-    # Создаем дефолтный тестовый ключ для разработки
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (telegram_id, api_key, is_active, expire_date) VALUES ('test_admin', 'demo-key-123', 1, '2030-01-01T00:00:00')")
-        conn.commit()
-
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    
+    # Пример тестового добавления администратора (замените '123456789' на ваш реальный Telegram Chat ID)
+    add_subscriber("123456789", days=365)
+    
+    print("🚀 Скальпер запущен в автономном режиме персональной Telegram-рассылки...")
+    hourly_scheduler_loop()
