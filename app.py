@@ -211,6 +211,23 @@ def update_scalp_signal(action, entry, sl, tp, reason=""):
     now_str = datetime.now(ZoneInfo("Europe/Chisinau")).strftime('%H:%M:%S')
     print(f"⚡ [ПОЧАСОВОЙ СИГНАЛ - {reason}] {action} @ {entry} (SL: {sl}, TP: {tp})")
 
+    # Автоматическая отправка сигнала на наш облачный сервер (server.py)
+    try:
+        cloud_payload = {
+            "action": action,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+            "authorization_token": "YOUR_SUPER_SECRET_SERVER_KEY_123"
+        }
+        res = requests.post("http://127.0.0.1:8000/api/publish-signal", json=cloud_payload, timeout=3)
+        if res.status_code == 200:
+            print("[✅] Сигнал успешно передан в облачный хаб для cBot!")
+        else:
+            print(f"[⚠️] Ошибка передачи сигнала на сервер: {res.text}")
+    except Exception as e:
+        print(f"[⚠️] Не удалось связаться с облачным сервером: {e}")
+
     # Формирование отчета для личной рассылки подписчикам
     icon = "🟢" if action == "BUY" else "🔴"
     msg = (
@@ -333,8 +350,8 @@ def hourly_scheduler_loop():
 if __name__ == '__main__':
     init_db()
     
-    # Пример тестового добавления администратора (замените '123456789' на ваш реальный Telegram Chat ID)
-    add_subscriber("123456789", days=365)
+    # Ваш реальный Telegram Chat ID добавлен в подписчики
+    add_subscriber("5336899154", days=365)
     
     print("🚀 Скальпер запущен в автономном режиме персональной Telegram-рассылки...")
     hourly_scheduler_loop()
